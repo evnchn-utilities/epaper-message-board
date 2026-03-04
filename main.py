@@ -26,8 +26,8 @@ from PIL import Image, ImageDraw, ImageFont
 # ---------------------------------------------------------------------------
 
 class MessageIn(BaseModel):
-    header: str = Field(..., description="Message header, max 30 visible chars. Supports ANSI color codes (e.g. \\033[31m for red).", max_length=200)
-    body: str = Field("", description="Message body, max 2 lines of 50 visible chars each, separated by \\n. Supports ANSI color codes.", max_length=500)
+    header: str = Field(..., description="Message header, max 30 visible chars. Supports ANSI background highlight codes (\\033[40m-47m, \\033[0m reset). Codes don't count toward char limit.", max_length=200)
+    body: str = Field("", description="Message body, max 2 lines of 50 visible chars each, separated by \\n. Same ANSI highlight codes as header. Caller must line-break to fit.", max_length=500)
 
 class MessageOut(BaseModel):
     id: int
@@ -62,9 +62,9 @@ except ImportError:
 # Config
 # ---------------------------------------------------------------------------
 DB_PATH = Path(__file__).parent / "messages.db"
+SETTINGS_PATH = Path(__file__).parent / "settings.json"
 DISPLAY_WIDTH = 1448
 DISPLAY_HEIGHT = 1072
-VCOM = -2.00
 SPI_HZ = 24000000
 MARGIN = 30
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
@@ -80,29 +80,46 @@ _epd = None  # lazily initialised AutoEPDDisplay
 _last_frame: Image.Image | None = None  # last rendered RGB frame
 
 # ---------------------------------------------------------------------------
+# Persistent settings (VCOM, display mode, enhanced driving)
+# ---------------------------------------------------------------------------
+import json as _json
+
+_DEFAULT_SETTINGS = {
+    "vcom": -2.00,
+}
+
+
+
+
+def _load_settings() -> dict:
+    try:
+        return {**_DEFAULT_SETTINGS, **_json.loads(SETTINGS_PATH.read_text())}
+    except (FileNotFoundError, _json.JSONDecodeError):
+        return dict(_DEFAULT_SETTINGS)
+
+
+def _save_settings(settings: dict):
+    SETTINGS_PATH.write_text(_json.dumps(settings, indent=2))
+
+# ---------------------------------------------------------------------------
 # ANSI escape sequence handling
 # ---------------------------------------------------------------------------
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
-# Map ANSI color codes to RGB tuples for color e-paper
-_ANSI_RGB = {
-    30: (0, 0, 0),         # black
-    31: (255, 0, 0),       # red
-    32: (0, 255, 0),       # green
-    33: (255, 255, 0),     # yellow
-    34: (0, 0, 255),       # blue
-    35: (255, 0, 255),     # magenta
-    36: (0, 255, 255),     # cyan
-    37: (255, 255, 255),   # white
-    90: (128, 128, 128),   # bright black (gray)
-    91: (255, 80, 80),     # bright red
-    92: (80, 255, 80),     # bright green
-    93: (255, 255, 80),    # bright yellow
-    94: (80, 80, 255),     # bright blue
-    95: (255, 80, 255),    # bright magenta
-    96: (80, 255, 255),    # bright cyan
-    97: (224, 224, 224),   # bright white
+# Map ANSI background color codes to RGB tuples for highlight rendering
+_ANSI_BG_RGB = {
+    40: (0, 0, 0),         # black bg
+    41: (255, 0, 0),       # red bg
+    42: (0, 255, 0),       # green bg
+    43: (255, 255, 0),     # yellow bg
+    44: (0, 0, 255),       # blue bg
+    45: (255, 0, 255),     # magenta bg
+    46: (0, 255, 255),     # cyan bg
+    47: (255, 255, 255),   # white bg
 }
+
+# Dark backgrounds get white text, light backgrounds get black text
+_DARK_BGS = {40, 41, 42, 44, 45}  # black, red, green, blue, magenta
 
 
 def strip_ansi(text: str) -> str:
@@ -110,53 +127,56 @@ def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
-def parse_ansi_segments(text: str) -> list[tuple[str, tuple]]:
-    """Parse text with ANSI codes into [(text, rgb_tuple), ...] segments."""
+def _fg_for_bg(bg_code: int | None) -> tuple:
+    """Return white text for dark backgrounds, black for light/no background."""
+    return (255, 255, 255) if bg_code in _DARK_BGS else (0, 0, 0)
+
+
+def parse_ansi_segments(text: str) -> list[tuple[str, tuple, tuple | None]]:
+    """Parse text with ANSI codes into [(text, fg_rgb, bg_rgb|None), ...] segments."""
     segments = []
-    current_fill = (0, 0, 0)  # default black
+    bg_code = None  # current background ANSI code
+    bg_rgb = None   # current background RGB
     pos = 0
     for m in _ANSI_RE.finditer(text):
-        # Text before this escape
         if m.start() > pos:
-            segments.append((text[pos:m.start()], current_fill))
-        # Parse the escape code
-        codes_str = m.group()[2:-1]  # strip \033[ and m
+            segments.append((text[pos:m.start()], _fg_for_bg(bg_code), bg_rgb))
+        codes_str = m.group()[2:-1]
         if codes_str:
             for code in codes_str.split(";"):
                 c = int(code) if code else 0
                 if c == 0:
-                    current_fill = (0, 0, 0)  # reset
-                elif c == 1:
-                    pass  # bold — no-op for now
-                elif c in _ANSI_RGB:
-                    current_fill = _ANSI_RGB[c]
+                    bg_code = None
+                    bg_rgb = None
+                elif c in _ANSI_BG_RGB:
+                    bg_code = c
+                    bg_rgb = _ANSI_BG_RGB[c]
         pos = m.end()
-    # Remaining text
     if pos < len(text):
-        segments.append((text[pos:], current_fill))
+        segments.append((text[pos:], _fg_for_bg(bg_code), bg_rgb))
     return segments
 
 
-# Map ANSI codes to CSS color names for the web UI
-_ANSI_CSS = {
-    30: "black", 31: "red", 32: "green", 33: "#b8860b", 34: "blue",
-    35: "magenta", 36: "teal", 37: "lightgray",
-    90: "gray", 91: "#ff4444", 92: "#44cc44", 93: "#cccc44",
-    94: "#4444ff", 95: "#ff44ff", 96: "#44cccc", 97: "silver",
+# Map ANSI background codes to CSS for the web UI
+_ANSI_BG_CSS = {
+    40: ("black", "white"), 41: ("red", "white"), 42: ("lime", "white"),
+    43: ("yellow", "black"), 44: ("blue", "white"), 45: ("magenta", "white"),
+    46: ("cyan", "black"), 47: ("lightgray", "black"),
 }
 
 
 def ansi_to_html(text: str) -> str:
-    """Convert ANSI-colored text to HTML with <span> color styles."""
+    """Convert ANSI-colored text to HTML with background highlight styles."""
     import html as _html
     parts = []
-    current_color = None
+    current_style = None  # (bg_css, fg_css) or None
     pos = 0
     for m in _ANSI_RE.finditer(text):
         if m.start() > pos:
             chunk = _html.escape(text[pos:m.start()])
-            if current_color:
-                parts.append(f'<span style="color:{current_color}">{chunk}</span>')
+            if current_style:
+                bg, fg = current_style
+                parts.append(f'<span style="background:{bg};color:{fg};padding:0 2px">{chunk}</span>')
             else:
                 parts.append(chunk)
         codes_str = m.group()[2:-1]
@@ -164,14 +184,15 @@ def ansi_to_html(text: str) -> str:
             for code in codes_str.split(";"):
                 c = int(code) if code else 0
                 if c == 0:
-                    current_color = None
-                elif c in _ANSI_CSS:
-                    current_color = _ANSI_CSS[c]
+                    current_style = None
+                elif c in _ANSI_BG_CSS:
+                    current_style = _ANSI_BG_CSS[c]
         pos = m.end()
     if pos < len(text):
         chunk = _html.escape(text[pos:])
-        if current_color:
-            parts.append(f'<span style="color:{current_color}">{chunk}</span>')
+        if current_style:
+            bg, fg = current_style
+            parts.append(f'<span style="background:{bg};color:{fg};padding:0 2px">{chunk}</span>')
         else:
             parts.append(chunk)
     return "".join(parts)
@@ -270,8 +291,26 @@ def dismiss_all():
 def _get_epd():
     global _epd
     if _epd is None and EPAPER_AVAILABLE:
-        _epd = AutoEPDDisplay(vcom=VCOM, rotate="flip", mirror=False, spi_hz=SPI_HZ)
+        settings = _load_settings()
+        _epd = AutoEPDDisplay(vcom=settings["vcom"], rotate="flip", mirror=False, spi_hz=SPI_HZ)
+        _apply_enhanced_driving(_epd)
     return _epd
+
+
+def _apply_enhanced_driving(epd):
+    """Write enhanced driving capability register (0x0602 to reg 0x0038)."""
+    try:
+        epd.epd.write_register(0x0038, 0x0602)
+        log.info("Enhanced driving capability enabled")
+    except Exception:
+        log.exception("Failed to set enhanced driving register")
+
+
+def _reinit_epd():
+    """Re-initialize the display with current settings (e.g. after VCOM change)."""
+    global _epd
+    with _display_lock:
+        _epd = None  # force re-init on next use
 
 
 FOOTER_FONT_SIZE = 32
@@ -281,13 +320,17 @@ SEP_BODY_GAP = 16    # separator line to body text
 BODY_LINE_GAP = 8    # between body lines
 
 
-def _draw_ansi_text(draw: ImageDraw.Draw, x: float, y: float, text: str, font: ImageFont.FreeTypeFont):
-    """Draw text with ANSI color codes as RGB colors."""
+def _draw_ansi_text(draw: ImageDraw.Draw, x: float, y: float, text: str, font: ImageFont.FreeTypeFont, line_height: int = 0):
+    """Draw text with ANSI background highlights and contrasting foreground."""
     segments = parse_ansi_segments(text)
+    h = line_height or font.size
     cx = x
-    for segment_text, fill in segments:
-        draw.text((cx, y), segment_text, font=font, fill=fill)
-        cx += font.getlength(segment_text)
+    for segment_text, fg, bg in segments:
+        w = font.getlength(segment_text)
+        if bg is not None:
+            draw.rectangle([(cx, y), (cx + w, y + h)], fill=bg)
+        draw.text((cx, y), segment_text, font=font, fill=fg)
+        cx += w
 
 
 def _rgb_to_subpixel(rgb_img: Image.Image) -> Image.Image:
@@ -486,6 +529,7 @@ _INDEX_HTML = """<!DOCTYPE html>
   <li><a href="/docs">Interactive API Documentation (Swagger UI)</a></li>
   <li><a href="/redoc">API Documentation (ReDoc)</a></li>
   <li><a href="/dashboard">Dashboard</a></li>
+  <li><a href="/settings">Display Settings</a></li>
 </ul>
 </body>
 </html>"""
@@ -522,8 +566,23 @@ async def get_message(msg_id: int):
 @app.post("/api/message", response_model=CreatedOut, status_code=201,
           summary="Create a new message",
           description="Post a message to the e-paper display. Header max 30 visible chars, "
-                      "body max 2 lines of 50 visible chars. ANSI escape codes (e.g. \\033[31m) "
-                      "are supported for color and do not count toward char limits.",
+                      "body max 2 lines of 50 visible chars. ANSI escape codes are supported "
+                      "for color and do not count toward char limits.\n\n"
+                      "**Supported ANSI highlight codes (background colors):**\n\n"
+                      "| Code | Highlight | Text Color |\n"
+                      "|------|-----------|------------|\n"
+                      "| `\\033[40m` | Black | White |\n"
+                      "| `\\033[41m` | Red | White |\n"
+                      "| `\\033[42m` | Green | Black |\n"
+                      "| `\\033[43m` | Yellow | Black |\n"
+                      "| `\\033[44m` | Blue | White |\n"
+                      "| `\\033[45m` | Magenta | White |\n"
+                      "| `\\033[46m` | Cyan | Black |\n"
+                      "| `\\033[47m` | White | Black |\n"
+                      "| `\\033[0m` | Reset (no highlight) | Black |\n\n"
+                      "Text is rendered as highlighted (colored background) for maximum "
+                      "e-paper contrast. Text color is automatically chosen (white on dark "
+                      "backgrounds, black on light). Unsupported codes are silently ignored.",
           responses={400: {"model": ErrorOut}})
 async def post_message(data: MessageIn):
     err = _validate_message(data.header, data.body)
@@ -644,6 +703,39 @@ def dashboard():
 
     refresh()
     ui.timer(5.0, refresh)
+
+
+@ui.page("/settings")
+def settings_page():
+    ui.add_head_html('<meta name="viewport" content="width=device-width, initial-scale=1">')
+    settings = _load_settings()
+
+    with ui.column().classes("w-full max-w-2xl mx-auto p-4 gap-4"):
+        ui.label("E-Paper Settings").classes("text-2xl font-bold")
+        ui.link("Back to Dashboard", "/dashboard").classes("text-sm")
+
+        # VCOM slider
+        with ui.card().classes("w-full"):
+            ui.label("VCOM Voltage").classes("text-lg font-bold")
+            ui.label("Adjusts panel contrast. More negative = darker blacks. "
+                     "Check your panel's FPC cable for the recommended value.").classes("text-xs text-gray-500")
+            vcom_label = ui.label(f"{settings['vcom']:.2f} V").classes("text-xl font-mono")
+            vcom_slider = ui.slider(min=-3.0, max=-0.5, step=0.05, value=settings["vcom"]).props("label-always")
+            vcom_slider.on_value_change(lambda e: vcom_label.set_text(f"{e.value:.2f} V"))
+
+        status_label = ui.label("").classes("text-sm")
+
+        def apply_settings():
+            new_settings = {
+                "vcom": round(vcom_slider.value, 2),
+            }
+            _save_settings(new_settings)
+            _reinit_epd()
+            threading.Thread(target=update_display, daemon=True).start()
+            status_label.set_text(f"Settings applied. VCOM={new_settings['vcom']:.2f}V. "
+                                  f"Display refreshing...")
+
+        ui.button("Apply & Refresh Display", on_click=apply_settings).props("color=primary")
 
 
 # ---------------------------------------------------------------------------

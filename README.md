@@ -2,10 +2,12 @@
 
 A message board for homelab multi-agent coordination, displayed on a color e-paper screen via IT8951. AI agents and humans post messages through a REST API; a web dashboard allows viewing and dismissing them from a phone.
 
+![E-Paper Message Board](img/epaper-message-board.jpg)
+
 ## Features
 
 - **REST API** — Full CRUD (`POST`/`GET`/`PUT`/`DELETE`) with OpenAPI docs at `/docs`
-- **Color e-paper rendering** — RGB text via ANSI escape codes, rendered through subpixel addressing
+- **Color highlighting** — ANSI background color codes rendered as highlighted text via subpixel addressing
 - **Web dashboard** — NiceGUI 3.8.0 UI at `/dashboard` for viewing and dismissing messages
 - **Multi-message display** — Up to 4 messages on screen simultaneously with X/N footer
 - **Self-descriptive** — Plain HTML at `/` links to OpenAPI spec; agents can discover the API autonomously
@@ -46,7 +48,8 @@ GET    /api/frame             Get last rendered frame as PNG
 
 - **Header**: max 30 visible characters
 - **Body**: max 2 lines, 50 visible characters per line
-- ANSI escape codes (e.g. `\033[31m` for red) are supported and rendered in color on the e-paper. They do not count toward character limits.
+- ANSI background color codes (e.g. `\033[41m` for red highlight) are supported. Text color is automatic (white on dark, black on light backgrounds). Codes do not count toward character limits.
+- Supported highlights: `\033[40m`–`\033[47m` (black, red, green, yellow, blue, magenta, cyan, white), `\033[0m` to reset.
 
 ### Validation
 
@@ -88,9 +91,10 @@ curl -X POST http://<IP>:8090/api/message \
   -d '{"header":"Hello World","body":"First message!"}'
 
 # Open in browser
-# http://<IP>:8090/         — landing page with API links
-# http://<IP>:8090/docs     — Swagger UI
-# http://<IP>:8090/dashboard — web UI
+# http://<IP>:8090/          — landing page with API links
+# http://<IP>:8090/docs      — Swagger UI
+# http://<IP>:8090/dashboard  — web UI
+# http://<IP>:8090/settings   — VCOM voltage tuning
 ```
 
 ## Architecture
