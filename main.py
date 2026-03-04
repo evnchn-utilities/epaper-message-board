@@ -78,6 +78,7 @@ _db_lock = threading.Lock()
 _display_lock = threading.Lock()
 _epd = None  # lazily initialised AutoEPDDisplay
 _last_frame: Image.Image | None = None  # last rendered RGB frame
+_displayed_ids: list[int] = []  # IDs of messages currently shown on screen
 
 # ---------------------------------------------------------------------------
 # Persistent settings (VCOM, display mode, enhanced driving)
@@ -284,6 +285,21 @@ def dismiss_all():
         conn.close()
 
 
+def dismiss_displayed(ids: list[int]):
+    """Dismiss only the messages currently shown on screen."""
+    if not ids:
+        return
+    with _db_lock:
+        conn = _get_db()
+        placeholders = ",".join("?" * len(ids))
+        conn.execute(
+            "UPDATE messages SET status='dismissed' WHERE id IN (" + placeholders + ") AND status='queued'",
+            ids,
+        )
+        conn.commit()
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # E-Paper rendering
 # ---------------------------------------------------------------------------
@@ -443,8 +459,9 @@ def render_messages(messages: list[dict]):
     draw.text((footer_x, footer_y), footer_text, font=footer_font, fill=(128, 128, 128))
 
     # Convert RGB to subpixel-addressed grayscale for color e-paper
-    global _last_frame
+    global _last_frame, _displayed_ids
     _last_frame = img.copy()
+    _displayed_ids = [m["id"] for m in messages[:shown]]
     _push_to_display(_rgb_to_subpixel(img))
 
 
@@ -457,8 +474,9 @@ def render_idle():
     except OSError:
         font = ImageFont.load_default()
     draw.text((MARGIN, MARGIN), "No messages", font=font, fill=(128, 128, 128))
-    global _last_frame
+    global _last_frame, _displayed_ids
     _last_frame = img.copy()
+    _displayed_ids = []
     _push_to_display(_rgb_to_subpixel(img))
 
 
@@ -635,6 +653,18 @@ async def delete_message(msg_id: int):
     log.info("Message %d dismissed", msg_id)
     threading.Thread(target=update_display, daemon=True).start()
     return {"status": "dismissed"}
+
+
+@app.delete("/api/messages/displayed", response_model=StatusOut,
+            summary="Dismiss on-screen messages",
+            description="Dismiss only the messages currently rendered on the e-paper display. "
+                        "Queued messages not yet shown are preserved. Used by the WPS button hook.")
+async def delete_displayed_messages():
+    ids = list(_displayed_ids)
+    dismiss_displayed(ids)
+    log.info("Displayed messages dismissed: %s", ids)
+    threading.Thread(target=update_display, daemon=True).start()
+    return {"status": f"dismissed {len(ids)} displayed messages"}
 
 
 @app.delete("/api/messages", response_model=StatusOut,
