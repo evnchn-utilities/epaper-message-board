@@ -79,6 +79,7 @@ _display_lock = threading.Lock()
 _epd = None  # lazily initialised AutoEPDDisplay
 _last_frame: Image.Image | None = None  # last rendered RGB frame
 _displayed_ids: list[int] = []  # IDs of messages currently shown on screen
+_page_stack: list[int] = [0]    # stack of message-list start offsets (for prev/next page)
 
 # ---------------------------------------------------------------------------
 # Persistent settings (VCOM, display mode, enhanced driving)
@@ -384,7 +385,7 @@ def _rgb_to_subpixel(rgb_img: Image.Image) -> Image.Image:
     return gray_img
 
 
-def render_messages(messages: list[dict]):
+def render_messages(messages: list[dict], start: int = 0):
     """Draw as many messages as fit, with an X/N footer at the bottom."""
     img = Image.new("RGB", (DISPLAY_WIDTH, DISPLAY_HEIGHT), (255, 255, 255))
     draw = ImageDraw.Draw(img)
@@ -399,6 +400,7 @@ def render_messages(messages: list[dict]):
         body_font = ImageFont.load_default()
         footer_font = ImageFont.load_default()
 
+    page_messages = messages[start:]
     total = len(messages)
 
     # Reserve space for footer
@@ -408,7 +410,7 @@ def render_messages(messages: list[dict]):
     y = MARGIN
     shown = 0
 
-    for msg in messages:
+    for msg in page_messages:
         # Estimate space needed for this message header
         header_h = HEADER_FONT_SIZE + HEADER_SEP_GAP + 2 + SEP_BODY_GAP if msg["header"] else 0
         body_lines = msg["body"].split("\n") if msg["body"] else []
@@ -452,7 +454,14 @@ def render_messages(messages: list[dict]):
         y += MSG_GAP  # gap before next message
 
     # Draw footer
-    footer_text = f"{shown}/{total} messages shown"
+    first = start + 1
+    last = start + shown
+    if total == 0:
+        footer_text = "No messages"
+    elif shown == total:
+        footer_text = f"{total} message{'s' if total != 1 else ''}"
+    else:
+        footer_text = f"Messages {first}–{last} of {total}  (◄ ► to page)"
     footer_w = footer_font.getlength(footer_text)
     footer_x = (DISPLAY_WIDTH - footer_w) / 2  # center
     footer_y = DISPLAY_HEIGHT - MARGIN - FOOTER_FONT_SIZE
@@ -461,7 +470,7 @@ def render_messages(messages: list[dict]):
     # Convert RGB to subpixel-addressed grayscale for color e-paper
     global _last_frame, _displayed_ids
     _last_frame = img.copy()
-    _displayed_ids = [m["id"] for m in messages[:shown]]
+    _displayed_ids = [m["id"] for m in page_messages[:shown]]
     _push_to_display(_rgb_to_subpixel(img))
 
 
@@ -499,11 +508,49 @@ def _push_to_display(img: Image.Image):
 
 def update_display():
     """Render all queued messages (or idle screen) on the e-paper."""
+    global _page_stack
     messages = get_queued_messages()
     if messages:
-        render_messages(messages)
+        # Clamp page stack so start offset is always valid
+        while len(_page_stack) > 1 and _page_stack[-1] >= len(messages):
+            _page_stack.pop()
+        if _page_stack and _page_stack[-1] >= len(messages):
+            _page_stack[0] = 0
+        start = _page_stack[-1] if _page_stack else 0
+        render_messages(messages, start=start)
     else:
+        _page_stack[:] = [0]
         render_idle()
+
+
+
+def next_page():
+    """Advance to the next page of messages."""
+    global _page_stack
+    messages = get_queued_messages()
+    if not messages:
+        return
+    next_start = (_page_stack[-1] if _page_stack else 0) + len(_displayed_ids)
+    if next_start < len(messages):
+        _page_stack.append(next_start)
+        threading.Thread(target=update_display, daemon=True).start()
+
+
+def prev_page():
+    """Go back to the previous page of messages."""
+    global _page_stack
+    if len(_page_stack) > 1:
+        _page_stack.pop()
+        threading.Thread(target=update_display, daemon=True).start()
+
+
+def clear_page():
+    """Dismiss messages on the current page and return to page 0."""
+    global _page_stack
+    ids = list(_displayed_ids)
+    dismiss_displayed(ids)
+    _page_stack[:] = [0]
+    threading.Thread(target=update_display, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -660,8 +707,10 @@ async def delete_message(msg_id: int):
             description="Dismiss only the messages currently rendered on the e-paper display. "
                         "Queued messages not yet shown are preserved. Used by the WPS button hook.")
 async def delete_displayed_messages():
+    global _page_stack
     ids = list(_displayed_ids)
     dismiss_displayed(ids)
+    _page_stack[:] = [0]
     log.info("Displayed messages dismissed: %s", ids)
     threading.Thread(target=update_display, daemon=True).start()
     return {"status": f"dismissed {len(ids)} displayed messages"}
@@ -688,6 +737,51 @@ async def get_frame():
     buf = io.BytesIO()
     _last_frame.save(buf, format="PNG")
     return Response(content=buf.getvalue(), media_type="image/png")
+
+
+# ---------------------------------------------------------------------------
+# Mouse input listener
+# ---------------------------------------------------------------------------
+import struct as _struct
+
+MOUSE_DEVICE = "/dev/input/event0"
+_EV_KEY = 0x01
+_BTN_LEFT   = 0x110  # 272
+_BTN_RIGHT  = 0x111  # 273
+_BTN_MIDDLE = 0x112  # 274
+# 64-bit Linux input_event: timeval(8+8) + type(2) + code(2) + value(4) = 24 bytes
+_INPUT_EVENT_FMT  = "qqHHi"
+_INPUT_EVENT_SIZE = _struct.calcsize(_INPUT_EVENT_FMT)
+
+
+def mouse_listener():
+    """Read mouse events and map clicks to page navigation / clear."""
+    import time as _time
+    while True:
+        try:
+            with open(MOUSE_DEVICE, "rb") as f:
+                log.info("Mouse listener started on %s (event size=%d)", MOUSE_DEVICE, _INPUT_EVENT_SIZE)
+                while True:
+                    data = f.read(_INPUT_EVENT_SIZE)
+                    if len(data) < _INPUT_EVENT_SIZE:
+                        break
+                    _, _, ev_type, ev_code, ev_value = _struct.unpack(_INPUT_EVENT_FMT, data)
+                    if ev_type == _EV_KEY and ev_value == 1:  # key-press only
+                        if ev_code == _BTN_LEFT:
+                            log.info("Mouse: left click → prev page")
+                            prev_page()
+                        elif ev_code == _BTN_RIGHT:
+                            log.info("Mouse: right click → next page")
+                            next_page()
+                        elif ev_code == _BTN_MIDDLE:
+                            log.info("Mouse: middle click → clear page")
+                            clear_page()
+        except FileNotFoundError:
+            log.warning("Mouse device %s not found, retrying in 5s", MOUSE_DEVICE)
+            _time.sleep(5)
+        except Exception:
+            log.exception("Mouse listener error, retrying in 5s")
+            _time.sleep(5)
 
 
 # ---------------------------------------------------------------------------
@@ -778,6 +872,8 @@ def on_startup():
     log.info("E-paper available: %s", EPAPER_AVAILABLE)
     # Render whatever is current (or idle)
     threading.Thread(target=update_display, daemon=True).start()
+    threading.Thread(target=mouse_listener, daemon=True).start()
+    log.info("Mouse listener thread started")
 
 app.on_startup(on_startup)
 
